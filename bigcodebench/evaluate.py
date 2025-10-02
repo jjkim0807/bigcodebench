@@ -372,7 +372,7 @@ def evaluate(
                             max_stack_limit,
                             sample["_identifier"],
                             min_time_limit,
-                            expected_time[task_id] if expected_time[task_id] else 20,
+                            expected_time.get(task_id, 20) or 20,
                         )
                         futures.append(executor.submit(check_correctness, *args))
                         completion_id[task_id] += 1
