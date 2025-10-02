@@ -27,21 +27,18 @@ import sys
 import time
 import types
 import unittest
-from multiprocessing import Array, Value, Manager
+from multiprocessing import Array, Manager, Value
 from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
-
-from bigcodebench.eval._special_oracle import (
-    _poly,
-)
+from bigcodebench.eval._special_oracle import _poly
 from bigcodebench.eval.utils import (
+    TIMEOUT_LIMIT,
     create_tempdir,
     reliability_guard,
+    safe_environment,
     swallow_io,
     time_limit,
-    safe_environment,
-    TIMEOUT_LIMIT,
 )
 
 
@@ -83,6 +80,65 @@ def estimate_pass_at_k(
     )
 
 
+def estimate_unbiased_pass_at_k(
+    num_samples: Union[int, List[int], np.ndarray],
+    num_correct: Union[List[int], np.ndarray],
+    k: int,
+) -> np.ndarray:
+    """
+    Estimates unbiased pass@k when there might be more than k samples.
+
+    For problems with exactly k samples, uses the standard estimator.
+    For problems with more than k samples (e.g., due to ties in ranking),
+    computes the expected pass@k by considering all possible combinations
+    of k samples from the n available samples.
+
+    This provides a theoretically correct estimate when you have n > k samples
+    and want to know the expected pass@k if you randomly selected k of them.
+    """
+    from math import comb
+
+    def standard_estimator(n: int, c: int, k: int) -> float:
+        """Standard pass@k estimator: 1 - comb(n - c, k) / comb(n, k)."""
+        if n - c < k:
+            return 1.0
+        return float(1.0 - np.prod(1.0 - k / np.arange(n - c + 1, n + 1)))
+
+    def unbiased_estimator(n: int, c: int, k: int) -> float:
+        """Unbiased pass@k estimator for n >= k samples."""
+        if n <= k:
+            return standard_estimator(n, c, k)
+
+        # For n > k, compute the expected pass@1 over all C(n,k) combinations
+        total_prob = 0.0
+        total_combinations = comb(n, k)
+
+        # For each possible number of correct samples in our k-sample subset
+        for correct_in_subset in range(min(c, k) + 1):
+            # Number of ways to choose correct_in_subset from c correct samples
+            # and (k - correct_in_subset) from (n - c) incorrect samples
+            if correct_in_subset <= c and (k - correct_in_subset) <= (n - c):
+                ways = comb(c, correct_in_subset) * comb(n - c, k - correct_in_subset)
+                # Probability that at least one is correct (pass@1 for this subset)
+                prob_pass = 1.0 if correct_in_subset > 0 else 0.0
+                total_prob += (ways / total_combinations) * prob_pass
+
+        return total_prob
+
+    if isinstance(num_samples, int):
+        num_samples_it = itertools.repeat(num_samples, len(num_correct))
+    else:
+        assert len(num_samples) == len(num_correct)
+        num_samples_it = iter(num_samples)
+
+    return np.array(
+        [
+            unbiased_estimator(int(n), int(c), k)
+            for n, c in zip(num_samples_it, num_correct)
+        ]
+    )
+
+
 PASS = "pass"
 FAIL = "fail"
 TIMEOUT = "timeout"
@@ -119,10 +175,10 @@ def unsafe_execute(
 ):
     with safe_environment(), create_tempdir():
         # These system calls are needed when cleaning up tempdir.
+        import builtins
         import os
         import shutil
-        import builtins
-        
+
         rmtree = shutil.rmtree
         rmdir = os.rmdir
         chdir = os.chdir
@@ -131,30 +187,34 @@ def unsafe_execute(
         module_name = "__test__"
         new_module = types.ModuleType(module_name)
         # Set necessary attributes for the module
-        new_module.__dict__.update({
-            '__builtins__': builtins,
-            '__file__': f"{module_name}.py",
-            '__package__': None,
-            '__doc__': None,
-            'sys': sys,
-            'os': os,
-            'environ': os.environ,
-        })
+        new_module.__dict__.update(
+            {
+                "__builtins__": builtins,
+                "__file__": f"{module_name}.py",
+                "__package__": None,
+                "__doc__": None,
+                "sys": sys,
+                "os": os,
+                "environ": os.environ,
+            }
+        )
 
         try:
             full_code = code + "\n" + test_code
 
             with swallow_io():
-                exec(compile(full_code, f"{module_name}.py", 'exec'), new_module.__dict__)
+                exec(
+                    compile(full_code, f"{module_name}.py", "exec"), new_module.__dict__
+                )
                 sys.modules[module_name] = new_module
-                TestCases = getattr(new_module, 'TestCases')
+                TestCases = getattr(new_module, "TestCases")
                 loader = unittest.TestLoader()
                 suite = loader.loadTestsFromTestCase(TestCases)
                 test_result = unittest.TestResult()
                 start_time = time.time()
                 with time_limit(timeout):
                     suite.run(test_result)
-            
+
             issues = test_result.failures + test_result.errors
             for test, trace in issues:
                 details[test.id().split(".")[-1]] = trace
@@ -176,10 +236,13 @@ def untrusted_check(
     max_data_limit: float,
     max_stack_limit: float,
     min_time_limit: float = 10,
-    gt_time_limit: float = 60
+    gt_time_limit: float = 60,
 ) -> Tuple[str, np.ndarray]:
     min_time_limit = max(min_time_limit, gt_time_limit)
-    timeout = max(os.getenv("BIGCODEBENCH_TIMEOUT_PER_TASK", TIMEOUT_LIMIT), min_time_limit) + 1
+    timeout = (
+        max(os.getenv("BIGCODEBENCH_TIMEOUT_PER_TASK", TIMEOUT_LIMIT), min_time_limit)
+        + 1
+    )
     # shared memory objects
     stat = Value("i", _UNKNOWN)
     manager = Manager()
@@ -200,7 +263,7 @@ def untrusted_check(
         ),
     )
     p.start()
-    p.join(timeout=timeout+1)
+    p.join(timeout=timeout + 1)
     if p.is_alive():
         p.terminate()
         time.sleep(0.1)
@@ -211,7 +274,7 @@ def untrusted_check(
     stat = _mapping[stat.value]
     # convert details to a dict
     details = dict(details)
-    
+
     if not stat:
         stat = TIMEOUT
     if stat == PASS:

@@ -6,40 +6,45 @@ import pickle
 import threading
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from concurrent.futures._base import CancelledError
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from warnings import warn
-from gradio_client import Client, handle_file
-from e2b import Sandbox
 
 import httpx
 import numpy as np
-from termcolor import cprint
-from tqdm import tqdm
-
-from bigcodebench.generate import run_codegen
-from bigcodebench.data import (
-    get_bigcodebench,
-    get_bigcodebench_hash,
-    load_solutions,
-)
+from bigcodebench.data import get_bigcodebench, get_bigcodebench_hash, load_solutions
 from bigcodebench.data.utils import CACHE_DIR
 from bigcodebench.eval import (
     PASS,
     compatible_eval_result,
     estimate_pass_at_k,
+    estimate_unbiased_pass_at_k,
     untrusted_check,
 )
 from bigcodebench.gen.util import trusted_check
+from bigcodebench.generate import run_codegen
+from e2b import Sandbox
+from gradio_client import Client, handle_file
+from termcolor import cprint
+from tqdm import tqdm
 
 # 1st item: the status
 # 2nd item (optional): the detailed pass/fail boolean for each input
 Result = Tuple[str, List[bool]]
 
 
-def get_groundtruth(n_workers, problems, hashcode, check_gt_only, max_as_limit, max_data_limit, max_stack_limit, min_time_limit):
+def get_groundtruth(
+    n_workers,
+    problems,
+    hashcode,
+    check_gt_only,
+    max_as_limit,
+    max_data_limit,
+    max_stack_limit,
+    min_time_limit,
+):
     cache_file = os.path.join(CACHE_DIR, f"{hashcode}.pkl")
     if os.path.exists(cache_file):
         if check_gt_only:
@@ -52,12 +57,12 @@ def get_groundtruth(n_workers, problems, hashcode, check_gt_only, max_as_limit, 
     os.makedirs(CACHE_DIR, exist_ok=True)
     print("\nAsserting the groundtruth...")
     tbegin = time.time()
-    
+
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         futures = []
         n_samples = 0
         expected_time = dict()
-        
+
         for problem in problems.values():
             args = (
                 problem["complete_prompt"] + "\n" + problem["canonical_solution"],
@@ -68,21 +73,22 @@ def get_groundtruth(n_workers, problems, hashcode, check_gt_only, max_as_limit, 
                 max_stack_limit,
                 min_time_limit,
             )
-            
+
             futures.append(executor.submit(trusted_check, *args))
             n_samples += 1
 
         for future in tqdm(as_completed(futures), total=n_samples):
             result = future.result()
             expected_time[result["task_id"]] = result["time"]
-    
+
     print(f"Expected outputs computed in {time.time() - tbegin:.2f}s")
-    
+
     if any(expected_time.values()):
         with open(cache_file, "wb") as f:
             pickle.dump(expected_time, f)
 
     return expected_time
+
 
 def check_correctness(
     completion_id: int,
@@ -119,7 +125,7 @@ def evaluate(
     subset: str,
     samples: Optional[str] = None,
     no_execute: bool = False,
-    execution: str = "gradio", # "e2b", "gradio", "local"
+    execution: str = "gradio",  # "e2b", "gradio", "local"
     selective_evaluate: str = "",
     e2b_endpoint: str = "bigcodebench_evaluator",
     gradio_endpoint: str = "https://bigcode-bigcodebench-evaluator.hf.space/",
@@ -128,31 +134,32 @@ def evaluate(
     calibrated: bool = True,
     parallel: int = -1,
     min_time_limit: float = 1,
-    max_as_limit: int = 30*1024,
-    max_data_limit: int = 30*1024,
+    max_as_limit: int = 30 * 1024,
+    max_data_limit: int = 30 * 1024,
     max_stack_limit: int = 10,
     check_gt_only: bool = False,
     no_gt: bool = False,
+    use_unbiased: bool = False,
     **model_kwargs,
-):  
+):
     if not samples and model_kwargs:
         samples = run_codegen(
             split=split,
             subset=subset,
             **model_kwargs,
         )
-    
+
     if no_execute:
         return
-    
+
     assert samples is not None, "No samples provided"
-        
+
     if os.path.isdir(samples):
         result_path = os.path.join(samples, "eval_results.json")
     else:
         assert samples.endswith(".jsonl")
         result_path = samples.replace(".jsonl", "_eval_results.json")
-    
+
     if execution == "gradio":
         while True:
             try:
@@ -171,7 +178,7 @@ def evaluate(
                     check_gt_only=check_gt_only,
                     no_gt=no_gt,
                     selective_evaluate=selective_evaluate,
-                    api_name="/predict"
+                    api_name="/predict",
                 )
                 break
             except (httpx.ReadTimeout, CancelledError):
@@ -179,30 +186,39 @@ def evaluate(
                 time.sleep(4)
         gt_pass_rate = pass_at_k["gt_pass_rate"]
         failed_tasks = pass_at_k["failed_tasks"]
-    
+
     elif execution == "e2b":
-        sandbox = Sandbox(e2b_endpoint, api_key=os.environ["E2B_API_KEY"], timeout=60*60)
+        sandbox = Sandbox(
+            e2b_endpoint, api_key=os.environ["E2B_API_KEY"], timeout=60 * 60
+        )
 
         # upload file to sandbox
         with open(samples, "r") as file:
             sandbox.files.write(samples, file)
-        
+
         # run the evaluation
         print(f"Command run in sandbox {e2b_endpoint}")
-        command = "bigcodebench.evaluate  --execution 'local' "\
-                        f"--split {split} --subset {subset} --samples {samples} "\
-                        f"--pass_k {pass_k} --save_pass_rate {save_pass_rate} --calibrated {calibrated} "\
-                        f"--parallel {parallel} --selective_evaluate {selective_evaluate} --min_time_limit {min_time_limit} "\
-                        f"--max_as_limit {max_as_limit} --max_data_limit {max_data_limit} --max_stack_limit {max_stack_limit} "
-        
-        if  check_gt_only:
+        command = (
+            "bigcodebench.evaluate  --execution 'local' "
+            f"--split {split} --subset {subset} --samples {samples} "
+            f"--pass_k {pass_k} --save_pass_rate {save_pass_rate} --calibrated {calibrated} "
+            f"--parallel {parallel} --selective_evaluate {selective_evaluate} --min_time_limit {min_time_limit} "
+            f"--max_as_limit {max_as_limit} --max_data_limit {max_data_limit} --max_stack_limit {max_stack_limit} "
+        )
+
+        if check_gt_only:
             command += f"--check_gt_only "
         if no_gt:
             command += f"--no_gt "
         if no_execute:
             command += f"--no_execute "
-        sandbox.commands.run(command, on_stdout=lambda x: print(x), on_stderr=lambda x: print(x), timeout=60*60)
-        
+        sandbox.commands.run(
+            command,
+            on_stdout=lambda x: print(x),
+            on_stderr=lambda x: print(x),
+            timeout=60 * 60,
+        )
+
         if not check_gt_only:
             # download the results
             content = sandbox.files.read(result_path)
@@ -210,7 +226,7 @@ def evaluate(
                 file.write(content)
 
     else:
-        
+
         pass_at_k = dict()
 
         if isinstance(pass_k, str):
@@ -221,7 +237,7 @@ def evaluate(
             passk = list(pass_k)
         else:
             raise ValueError(f"Invalid type for pass_k: {type(pass_k)}")
-        
+
         if selective_evaluate and isinstance(selective_evaluate, str):
             selected_ids = set(selective_evaluate.split(","))
         else:
@@ -240,23 +256,42 @@ def evaluate(
             samples = "__dummy__.jsonl"
 
         problems = get_bigcodebench(subset=subset)
-        
+
         # Add selective evaluation logic
         if selected_ids:
             problems = {k: v for k, v in problems.items() if k in selected_ids}
             if not problems:
-                raise ValueError(f"None of the provided task IDs {selected_ids} were found in the dataset")
+                raise ValueError(
+                    f"None of the provided task IDs {selected_ids} were found in the dataset"
+                )
 
         dataset_hash = get_bigcodebench_hash(subset=subset)
-        
+
         if not no_gt:
-            expected_time = get_groundtruth(n_workers, problems, dataset_hash, check_gt_only, max_as_limit, max_data_limit, max_stack_limit, min_time_limit)
+            expected_time = get_groundtruth(
+                n_workers,
+                problems,
+                dataset_hash,
+                check_gt_only,
+                max_as_limit,
+                max_data_limit,
+                max_stack_limit,
+                min_time_limit,
+            )
         else:
             expected_time = {task_id: None for task_id in problems}
-        
-        gt_pass_rate = np.mean([1 if v is not None else 0 for k, v in expected_time.items() if k in problems])
-        failed_tasks = [k for k, v in expected_time.items() if v is None and k in problems]
-        
+
+        gt_pass_rate = np.mean(
+            [
+                1 if v is not None else 0
+                for k, v in expected_time.items()
+                if k in problems
+            ]
+        )
+        failed_tasks = [
+            k for k, v in expected_time.items() if v is None and k in problems
+        ]
+
         if os.path.isfile(result_path):
             print(f"Load from previous results from {result_path}")
             with open(result_path, "r") as f:
@@ -265,17 +300,20 @@ def evaluate(
             results = compatible_eval_result(results)
         else:
             if check_gt_only:
-            
+
                 if gt_pass_rate > 0.99:
                     cprint(f"Groundtruth pass rate: {gt_pass_rate:.3f}", "green")
                 else:
-                    cprint(f"Groundtruth pass rate: {gt_pass_rate:.3f}\nPlease be cautious!", "red")
-            
+                    cprint(
+                        f"Groundtruth pass rate: {gt_pass_rate:.3f}\nPlease be cautious!",
+                        "red",
+                    )
+
                 if len(failed_tasks) > 0:
                     cprint(f"Failed tasks: {failed_tasks}", "red")
-                
+
                 return
-            
+
             else:
                 results = {
                     "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -292,18 +330,23 @@ def evaluate(
                     print("Reading samples...")
                     for sample in tqdm(load_solutions(samples)):
                         task_id = sample["task_id"]
-                        
+
                         if task_id not in problems:
                             # Skip if task is not in problems (either not in dataset or filtered out by selective_evaluate)
                             continue
-                            
+
                         solution = (
                             sample["solution"]
                             if "solution" in sample
-                            else problems[task_id]["complete_prompt"] + sample["completion"]
+                            else problems[task_id]["complete_prompt"]
+                            + sample["completion"]
                         )
                         if calibrated:
-                            solution = problems[task_id]["code_prompt"] + "\n    pass\n" + solution
+                            solution = (
+                                problems[task_id]["code_prompt"]
+                                + "\n    pass\n"
+                                + solution
+                            )
                         remainings.add(sample["_identifier"])
                         args = (
                             completion_id[task_id],
@@ -314,25 +357,35 @@ def evaluate(
                             max_stack_limit,
                             sample["_identifier"],
                             min_time_limit,
-                            expected_time[task_id] if expected_time[task_id] else 20
+                            expected_time[task_id] if expected_time[task_id] else 20,
                         )
                         futures.append(executor.submit(check_correctness, *args))
                         completion_id[task_id] += 1
                         n_samples += 1
 
                     # Modify the assertion to account for selective evaluation
-                    assert n_samples == len(remainings), "Missing problems in unfinished"
+                    assert n_samples == len(
+                        remainings
+                    ), "Missing problems in unfinished"
                     # Only check against problems that weren't filtered out
-                    assert len(completion_id) == len(problems), f"Missing problems in samples. Expected {len(problems)} problems, got {len(completion_id)}"
+                    assert len(completion_id) == len(
+                        problems
+                    ), f"Missing problems in samples. Expected {len(problems)} problems, got {len(completion_id)}"
 
                     def stucking_checker():
                         not_done = futures
                         while len(not_done) > 0:
-                            done, not_done = wait(not_done, timeout=240, return_when=FIRST_COMPLETED)
+                            done, not_done = wait(
+                                not_done, timeout=240, return_when=FIRST_COMPLETED
+                            )
 
                             if len(done) == 0:
-                                warn("No samples have finished testing in the last 240s")
-                                warn(f"{len(remainings)} samples to be tested: {remainings}")
+                                warn(
+                                    "No samples have finished testing in the last 240s"
+                                )
+                                warn(
+                                    f"{len(remainings)} samples to be tested: {remainings}"
+                                )
 
                     threading.Thread(target=stucking_checker).start()
 
@@ -368,11 +421,29 @@ def evaluate(
 
         base_correct = np.array(base_correct)
 
-        pass_at_k.update({
-            f"pass@{k}": estimate_pass_at_k(total, base_correct, k).mean()
-            for k in passk
-            if total.min() >= k
-        })
+        # Choose estimator based on use_unbiased flag
+        estimator_func = (
+            estimate_unbiased_pass_at_k if use_unbiased else estimate_pass_at_k
+        )
+
+        if use_unbiased:
+            # With unbiased estimator, we can handle cases where some problems have >= k samples
+            pass_at_k.update(
+                {
+                    f"pass@{k}": estimator_func(total, base_correct, k).mean()
+                    for k in passk
+                    if (total >= k).any()
+                }
+            )
+        else:
+            # With standard estimator, all problems must have >= k samples
+            pass_at_k.update(
+                {
+                    f"pass@{k}": estimator_func(total, base_correct, k).mean()
+                    for k in passk
+                    if total.min() >= k
+                }
+            )
 
         pass_at_k["model"] = os.path.basename(samples).split("--bigcodebench-")[0]
         pass_at_k["split"] = split
@@ -380,22 +451,24 @@ def evaluate(
         pass_at_k["calibrated"] = calibrated
         pass_at_k["gt_pass_rate"] = gt_pass_rate
         pass_at_k["failed_tasks"] = failed_tasks
-            
+
     extra = subset.capitalize()
     split = split.capitalize()
     cprint(f"BigCodeBench-{split} ({extra})", "green")
-        
+
     if no_gt:
         cprint(f"Groundtruth is not checked", "yellow")
     else:
         if gt_pass_rate > 0.99:
             cprint(f"Groundtruth pass rate: {gt_pass_rate:.3f}", "green")
         else:
-            cprint(f"Groundtruth pass rate: {gt_pass_rate:.3f}\nPlease be cautious!", "red")
-        
+            cprint(
+                f"Groundtruth pass rate: {gt_pass_rate:.3f}\nPlease be cautious!", "red"
+            )
+
         if len(failed_tasks) > 0:
             cprint(f"Failed tasks: {failed_tasks}", "red")
-    
+
     for k, v in pass_at_k.items():
         if k.startswith("pass@"):
             cprint(f"{k}:\t{v:.3f}", "green")
@@ -428,7 +501,7 @@ def evaluate(
             for k in saved_pass_at_k.keys():
                 if pass_at_k[k] != saved_pass_at_k[k]:
                     cprint(f"Warning: {k} is different from the saved one", "yellow")
-                    
+
             # ask user whether to save the pass@k
             decision = ""
             while decision.lower() not in ["y", "n"]:
@@ -440,7 +513,7 @@ def evaluate(
                     new_path += ".bak"
                 os.rename(pass_at_k_path, new_path)
                 print(f"Backup {pass_at_k_path} to {new_path}")
-        
+
         if not os.path.isfile(pass_at_k_path):
             with open(pass_at_k_path, "w") as f:
                 json.dump(pass_at_k, f, indent=2)
@@ -450,6 +523,7 @@ def main():
     from fire import Fire
 
     Fire(evaluate)
+
 
 if __name__ == "__main__":
     main()
