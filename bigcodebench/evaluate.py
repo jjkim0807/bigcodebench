@@ -167,7 +167,7 @@ def evaluate(
             print("Error: use_unbiased is not supported with gradio remote evaluation.")
             print("Please use --execution local for unbiased pass@k estimation.")
             return
-        
+
         while True:
             try:
                 client = Client(gradio_endpoint)
@@ -201,7 +201,7 @@ def evaluate(
             print("Error: use_unbiased is not supported with e2b remote evaluation.")
             print("Please use --execution local for unbiased pass@k estimation.")
             return
-        
+
         sandbox = Sandbox(
             e2b_endpoint, api_key=os.environ["E2B_API_KEY"], timeout=60 * 60
         )
@@ -226,7 +226,7 @@ def evaluate(
             command += f"--no_gt "
         if no_execute:
             command += f"--no_execute "
-        
+
         sandbox.commands.run(
             command,
             on_stdout=lambda x: print(x),
