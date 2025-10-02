@@ -161,6 +161,13 @@ def evaluate(
         result_path = samples.replace(".jsonl", "_eval_results.json")
 
     if execution == "gradio":
+        # Note: Remote gradio endpoint does not support use_unbiased parameter
+        # For unbiased pass@k, use local execution mode
+        if use_unbiased:
+            print("Error: use_unbiased is not supported with gradio remote evaluation.")
+            print("Please use --execution local for unbiased pass@k estimation.")
+            return
+        
         while True:
             try:
                 client = Client(gradio_endpoint)
@@ -188,6 +195,13 @@ def evaluate(
         failed_tasks = pass_at_k["failed_tasks"]
 
     elif execution == "e2b":
+        # Note: Remote e2b endpoint does not support use_unbiased parameter
+        # For unbiased pass@k, use local execution mode
+        if use_unbiased:
+            print("Error: use_unbiased is not supported with e2b remote evaluation.")
+            print("Please use --execution local for unbiased pass@k estimation.")
+            return
+        
         sandbox = Sandbox(
             e2b_endpoint, api_key=os.environ["E2B_API_KEY"], timeout=60 * 60
         )
@@ -212,6 +226,7 @@ def evaluate(
             command += f"--no_gt "
         if no_execute:
             command += f"--no_execute "
+        
         sandbox.commands.run(
             command,
             on_stdout=lambda x: print(x),
