@@ -44,10 +44,11 @@ def get_groundtruth(
     max_data_limit,
     max_stack_limit,
     min_time_limit,
+    no_cache=False,
 ):
     cache_file = os.path.join(CACHE_DIR, f"{hashcode}.pkl")
     if os.path.exists(cache_file):
-        if check_gt_only:
+        if check_gt_only or no_cache:
             os.remove(cache_file)
         else:
             print(f"Load from ground-truth from {cache_file}")
@@ -140,6 +141,7 @@ def evaluate(
     check_gt_only: bool = False,
     no_gt: bool = False,
     use_unbiased: bool = False,
+    no_cache: bool = False,
     **model_kwargs,
 ):
     if not samples and model_kwargs:
@@ -292,6 +294,7 @@ def evaluate(
                 max_data_limit,
                 max_stack_limit,
                 min_time_limit,
+                no_cache,
             )
         else:
             expected_time = {task_id: None for task_id in problems}
